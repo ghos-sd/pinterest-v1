@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-import os, re, json, asyncio, tempfile, logging, html
+import os
+import re
+import json
+import tempfile
+import logging
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
@@ -10,39 +14,60 @@ from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ------------- إعدادات عامة -------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("pinterest-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/124.0.0.0 Safari/537.36")
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 HEADERS = {
     "User-Agent": UA,
     "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
 }
 
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=35)
 
 PIN_HOSTS = {
-    "pinterest.com","www.pinterest.com","in.pinterest.com",
-    "www.pinterest.co.uk","ar.pinterest.com","de.pinterest.com",
+    "pinterest.com", "www.pinterest.com", "in.pinterest.com",
+    "www.pinterest.co.uk", "ar.pinterest.com", "de.pinterest.com",
     "pin.it"
 }
 
-# ------------- أدوات HTTP -------------
-async def get(session: aiohttp.ClientSession, url: str, **kw) -> str:
-    async with session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT, **kw) as r:
-        r.raise_for_status()
-        return await r.text()
+WELCOME = (
+    "Hi! 👋\n"
+    "Send me a Pinterest Pin URL and I’ll download the **video first** (if available), "
+    "or a high-quality image as a fallback.\n\n"
+    "Example:\nhttps://www.pinterest.com/pin/123456789/\n\n"
+    "Developed by @Ghostnosd"
+)
 
-async def expand_url(session: aiohttp.ClientSession, url: str) -> str:
-    """اتبع التحويلات + جرّب canonical/og:url عشان نوصل لصفحة /pin/…"""
+# ------------- أدوات مساعدة -------------
+async def http_text(session: aiohttp.ClientSession, url: str, **kw) -> Optional[str]:
+    try:
+        async with session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT, **kw) as r:
+            r.raise_for_status()
+            return await r.text()
+    except Exception as e:
+        log.debug("GET text fail %s: %s", url, e)
+        return None
+
+async def http_bytes_to_temp(session: aiohttp.ClientSession, url: str) -> str:
+    async with session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
+        r.raise_for_status()
+        ext = ".mp4" if url.lower().endswith(".mp4") else (
+            ".jpg" if any(x in url.lower() for x in (".jpg", ".jpeg")) else ""
+        )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
+            async for chunk in r.content.iter_chunked(1024 * 64):
+                f.write(chunk)
+            return f.name
+
+async def expand_pin_url(session: aiohttp.ClientSession, url: str) -> str:
+    """اتبع التحويلات + استخدم canonical/og:url عشان نوصل لصفحة /pin/…"""
     try:
         async with session.get(url, headers=HEADERS, allow_redirects=True, timeout=HTTP_TIMEOUT) as r:
             final_url = str(r.url)
@@ -64,7 +89,6 @@ def pin_id_from_url(url: str) -> Optional[str]:
     m = re.search(r"/pin/(\d+)", url)
     return m.group(1) if m else None
 
-# ------------- انتقاء الجودة -------------
 def pick_best_video(vlist: dict) -> Optional[str]:
     if not isinstance(vlist, dict):
         return None
@@ -73,7 +97,6 @@ def pick_best_video(vlist: dict) -> Optional[str]:
         d = vlist.get(q)
         if isinstance(d, dict) and d.get("url"):
             return d["url"]
-    # أي عنصر فيه url
     for d in vlist.values():
         if isinstance(d, dict) and d.get("url"):
             return d["url"]
@@ -87,15 +110,18 @@ def pick_best_image(images: dict) -> Optional[str]:
     best_u, best_area = None, -1
     for d in images.values():
         if isinstance(d, dict) and d.get("url"):
-            w, h = int(d.get("width") or 0), int(d.get("height") or 0)
-            area = w*h
+            try:
+                w, h = int(d.get("width") or 0), int(d.get("height") or 0)
+                area = w * h
+            except Exception:
+                area = 0
             if area >= best_area:
                 best_area, best_u = area, d["url"]
     return best_u
 
-# ------------- طرق استخراج (فيديو أولًا) -------------
+# ------------- استخراج (فيديو أولًا) -------------
 async def try_pidgets(session: aiohttp.ClientSession, pin_url: str) -> Tuple[Optional[str], Optional[str]]:
-    """API قديم غير موثّق لكنه يعمل علنًا لمعظم الـ Pins العامة."""
+    """API عام غير موثّق لكنه ينفع لمعظم الـ Pins العامة."""
     pid = pin_id_from_url(pin_url)
     if not pid:
         return None, None
@@ -105,8 +131,183 @@ async def try_pidgets(session: aiohttp.ClientSession, pin_url: str) -> Tuple[Opt
             if r.status != 200:
                 return None, None
             data = await r.json()
+
         pins = (((data or {}).get("data") or {}).get("pins") or [])
         if not pins:
+            return None, None
+
+        pin = pins[0]
+
+        # فيديو
+        vlist = (((pin.get("videos") or {}).get("video_list")) or {})
+        vurl = pick_best_video(vlist)
+        if vurl:
+            return vurl, "video"
+
+        # صورة
+        img_url = pick_best_image(pin.get("images") or {})
+        if img_url:
+            return img_url, "image"
+
+    except Exception:
+        pass
+    return None, None
+
+async def try_parse_page(session: aiohttp.ClientSession, pin_url: str) -> Tuple[Optional[str], Optional[str]]:
+    """نقرأ __PWS_DATA__/Redux + resourceResponses + meta tags."""
+    try:
+        html_text = await http_text(session, pin_url)
+        if not html_text:
+            return None, None
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        sc = soup.find("script", id="__PWS_DATA__")
+        if not (sc and sc.string):
+            for s in soup.find_all("script"):
+                if s.string and ("initialReduxState" in s.string or "__PWS_DATA__" in s.string):
+                    sc = s
+                    break
+
+        if sc and sc.string:
+            txt = re.sub(r"^[^{]*", "", sc.string.strip())
+            txt = re.sub(r";?\s*$", "", txt)
+            try:
+                data = json.loads(txt)
+            except Exception:
+                data = None
+
+            def deep_find(obj, keys):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if k in keys:
+                            return v
+                        got = deep_find(v, keys)
+                        if got is not None:
+                            return got
+                elif isinstance(obj, list):
+                    for it in obj:
+                        got = deep_find(it, keys)
+                        if got is not None:
+                            return got
+                return None
+
+            if data:
+                vlist = deep_find(data, ("video_list",))
+                if isinstance(vlist, dict):
+                    vurl = pick_best_video(vlist)
+                    if vurl:
+                        return vurl, "video"
+
+                images = deep_find(data, ("images",))
+                if isinstance(images, dict):
+                    iurl = pick_best_image(images)
+                    if iurl:
+                        return iurl, "image"
+
+        # Meta tags fallback
+        mv = soup.find("meta", property="og:video") or \
+             soup.find("meta", property="og:video:url") or \
+             soup.find("meta", property="twitter:player:stream")
+        if mv and mv.get("content"):
+            return mv["content"], "video"
+
+        mi = soup.find("meta", property="og:image")
+        if mi and mi.get("content"):
+            return mi["content"], "image"
+
+        # Regex لأي mp4 من pinimg
+        m = re.search(r"https?://[a-z0-9.-]*pinimg\.com/[^\s'\"<>]+\.mp4", html_text, flags=re.I)
+        if m:
+            return m.group(0), "video"
+
+    except Exception:
+        pass
+    return None, None
+
+async def extract_media(session: aiohttp.ClientSession, original_url: str) -> Tuple[Optional[str], Optional[str]]:
+    """يرجع (media_url, type) مع تفضيل الفيديو دائماً."""
+    try:
+        u = urlparse(original_url)
+        if not (u.netloc in PIN_HOSTS or "pinterest.com/pin/" in original_url):
+            return None, None
+    except Exception:
+        pass
+
+    pin_url = await expand_pin_url(session, original_url)
+
+    # 1) pidgets (أدق للفيديو)
+    u, t = await try_pidgets(session, pin_url)
+    if u:
+        return u, t
+
+    # 2) تحليل الصفحة
+    u, t = await try_parse_page(session, pin_url)
+    if u:
+        return u, t
+
+    return None, None
+
+# ------------- Telegram -------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(WELCOME)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(WELCOME)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    m = re.search(r"https?://\S+", text)
+    if not m:
+        await update.message.reply_text("أرسل رابط Pin من Pinterest.")
+        return
+    url = m.group(0)
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        media_url, media_type = await extract_media(session, url)
+
+        if not media_url:
+            await update.message.reply_text("Failed: No video/image found on this Pin (or it is private).")
+            return
+
+        try:
+            await update.message.chat.send_action(
+                ChatAction.UPLOAD_VIDEO if media_type == "video" else ChatAction.UPLOAD_PHOTO
+            )
+            path = await http_bytes_to_temp(session, media_url)
+
+            if media_type == "video":
+                await update.message.reply_video(video=InputFile(path), caption="Downloaded ✅")
+            else:
+                await update.message.reply_photo(photo=InputFile(path), caption="Downloaded ✅ (image)")
+        except Exception as e:
+            log.exception("Send failed")
+            await update.message.reply_text(f"Download failed: {e}")
+        finally:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("Set BOT_TOKEN environment variable.")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    log.info("Pinterest bot is running…")
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()        if not pins:
             return None, None
         pin = pins[0]
         # VIDEO
