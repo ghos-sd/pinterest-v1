@@ -331,7 +331,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             log.exception("Send failed")
-            await update.message.reply_text(f"Download failed: {e}")
+            # Added more specific error handling for Telegram's Image_process_failed
+            if "Image_process_failed" in str(e):
+                await update.message.reply_text(
+                    "Download failed: Telegram could not process the file. The file may be corrupt or in an unsupported format."
+                )
+            else:
+                await update.message.reply_text(f"Download failed: {e}")
         finally:
             try:
                 if path and os.path.exists(path):
