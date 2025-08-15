@@ -252,7 +252,7 @@ if __name__ == "__main__":
         if isinstance(val, dict):
             u = val.get("url")
             if u:
-                return u
+                return 
     return None
 
 
