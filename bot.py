@@ -42,7 +42,6 @@ def expand_url(url: str) -> str:
         final_url = r.url or url
         if "/pin/" in final_url:
             return final_url
-
         soup = BeautifulSoup(r.text, "html.parser")
         can = soup.find("link", rel="canonical")
         if can and "/pin/" in (can.get("href") or ""):
@@ -84,7 +83,7 @@ def _pick_best_image(images: dict) -> Optional[str]:
 def _pick_best_video(video_list: dict) -> Optional[str]:
     if not isinstance(video_list, dict):
         return None
-    order = ["V_720P", "V_640P", "V_480P", "V_360P", "V_240P", "V_EXP4"]
+    order = ["V_1080P","V_720P","V_640P","V_480P","V_360P","V_240P","V_EXP4"]
     for q in order:
         if q in video_list and isinstance(video_list[q], dict):
             u = video_list[q].get("url")
@@ -98,6 +97,26 @@ def _pick_best_video(video_list: dict) -> Optional[str]:
     return None
 
 
+# ===== أدوات بحث داخل JSON =====
+def _find_in(obj: Any, keys: Tuple[str, ...]) -> Optional[Any]:
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in keys:
+                    return v
+                found = _find_in(v, keys)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for it in obj:
+                found = _find_in(it, keys)
+                if found is not None:
+                    return found
+    except Exception:
+        pass
+    return None
+
+
 # ===== مصادر الاستخراج (بدون API رسمي) =====
 def pin_id_from_url(url: str) -> Optional[str]:
     m = re.search(r"/pin/(\d+)", url)
@@ -105,7 +124,7 @@ def pin_id_from_url(url: str) -> Optional[str]:
 
 
 def try_pidgets(pin_url: str) -> Tuple[Optional[str], Optional[str]]:
-    """Widgets/pidgets قديم لكنه غالباً مفيد: يعيد فيديو أو صورة."""
+    """Widgets/pidgets: يعيد فيديو أو صورة."""
     pid = pin_id_from_url(pin_url)
     if not pid:
         return None, None
@@ -124,13 +143,11 @@ def try_pidgets(pin_url: str) -> Tuple[Optional[str], Optional[str]]:
             return None, None
         pin = pins[0]
 
-        # فيديو؟
         vlist = (((pin.get("videos") or {}).get("video_list")) or {})
         vurl = _pick_best_video(vlist)
         if vurl:
             return vurl, "video"
 
-        # صورة؟
         img_url = _pick_best_image(pin.get("images") or {})
         if img_url:
             return img_url, "image"
@@ -139,8 +156,60 @@ def try_pidgets(pin_url: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def try_pws_json(pin_url: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    يقرأ JSON الداخلي من سكربت __PWS_DATA__/initialReduxState
+    ويبحث عن video_list أو images.
+    """
+    try:
+        html = get_html(pin_url)
+        soup = BeautifulSoup(html, "html.parser")
+        sc = soup.find("script", id="__PWS_DATA__")
+        if not sc or not sc.string:
+            # أي سكربت تاني فيه initialReduxState
+            for s in soup.find_all("script"):
+                if s.string and ("initialReduxState" in s.string or "__PWS_DATA__" in s.string):
+                    sc = s
+                    break
+        if not sc or not sc.string:
+            return None, None
+
+        text = sc.string.strip()
+        text = re.sub(r"^[^{]*", "", text)     # قبل أول {
+        text = re.sub(r";?\s*$", "", text)     # ; في النهاية
+        data = json.loads(text)
+
+        # احتمالات مواقع الداتا
+        redux = data
+        for key in ("props", "initialReduxState"):
+            if isinstance(redux, dict) and key in redux:
+                redux = redux[key]
+
+        video_list = _find_in(redux, ("video_list","videos"))
+        if isinstance(video_list, dict) and "video_list" not in video_list:
+            video_list = video_list.get("video_list", video_list)
+        images = _find_in(redux, ("images",))
+
+        if not video_list and not images:
+            rr = _find_in(data, ("resourceResponses",))
+            if rr:
+                video_list = _find_in(rr, ("video_list","videos"))
+                images = images or _find_in(rr, ("images",))
+
+        if video_list:
+            vurl = _pick_best_video(video_list)
+            if vurl:
+                return vurl, "video"
+        if images:
+            iurl = _pick_best_image(images)
+            if iurl:
+                return iurl, "image"
+    except Exception:
+        pass
+    return None, None
+
+
 def try_oembed(pin_url: str) -> Tuple[Optional[str], Optional[str]]:
-    """oEmbed العام: غالباً يعطي thumbnail للصورة."""
     try:
         r = requests.get(
             "https://www.pinterest.com/oembed.json",
@@ -160,7 +229,6 @@ def try_oembed(pin_url: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def try_meta_fallback(pin_url: str) -> Tuple[Optional[str], Optional[str]]:
-    """نقرأ og:video / og:image مباشرة من صفحة Pin."""
     try:
         html = get_html(pin_url)
         soup = BeautifulSoup(html, "html.parser")
@@ -181,20 +249,11 @@ def extract_pinterest_media(pin_url: str) -> Tuple[str, str]:
     url = expand_url(pin_url)
     log.info("Expanded URL: %s", url)
 
-    # 1) pidgets (أفضل خيار غالباً)
-    u, t = try_pidgets(url)
-    if u:
-        return u, t
-
-    # 2) oEmbed كـ fallback سريع (صور فقط غالباً)
-    u, t = try_oembed(url)
-    if u:
-        return u, t
-
-    # 3) ميتا تاجز من الصفحة
-    u, t = try_meta_fallback(url)
-    if u:
-        return u, t
+    # ترتيب المحاولات: pidgets → JSON الداخلي → oembed → meta
+    for fn in (try_pidgets, try_pws_json, try_oembed, try_meta_fallback):
+        u, t = fn(url)
+        if u:
+            return u, t
 
     raise ValueError("لم أعثر على صورة أو فيديو في هذا الرابط. قد يكون خاص/Protected.")
 
@@ -208,15 +267,38 @@ def looks_like_pin(url: str) -> bool:
         return False
 
 
+def sniff_type_by_head(url: str) -> Optional[str]:
+    """يرجع 'video' لو Content-Type فيديو حتى لو الرابط شكله صورة."""
+    try:
+        h = requests.head(url, headers=HEADERS, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        ct = (h.headers.get("Content-Type") or "").lower()
+        if ct.startswith("video/"):
+            return "video"
+        if ct.startswith("image/"):
+            return "image"
+    except Exception:
+        pass
+    # fallback من الامتداد
+    p = urlparse(url).path.lower()
+    if p.endswith(".mp4") or p.endswith(".m3u8"):
+        return "video"
+    if any(p.endswith(ext) for ext in (".jpg",".jpeg",".png",".webp")):
+        return "image"
+    return None
+
+
 async def send_media(update: Update, media_url: str, media_type: str, filename_hint: str = ""):
-    # نحمّل المحتوى أولاً لنتحكم بالحجم ونوع الإرسال
+    # صحّح النوع إن كان الـ HEAD يقول فيديو
+    sniff = sniff_type_by_head(media_url)
+    if sniff == "video":
+        media_type = "video"
+
     with requests.get(media_url, headers=HEADERS, timeout=HTTP_TIMEOUT, stream=True) as r:
         r.raise_for_status()
         content = r.content
 
     cap = "تم التحميل ✅"
     if media_type == "video":
-        # حدود تيليجرام تختلف (قد تسمح حتى ~50-200MB حسب النوع)، نستخدم 45MB كحد آمن للفيديو
         if len(content) > 45 * 1024 * 1024:
             await update.message.reply_document(
                 document=content,
@@ -230,7 +312,6 @@ async def send_media(update: Update, media_url: str, media_type: str, filename_h
                 caption=cap
             )
     else:
-        # للصورة نرسل Photo لو <= 9MB وإلا Document
         if len(content) > 9 * 1024 * 1024:
             await update.message.reply_document(
                 document=content,
@@ -282,7 +363,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         media_url, media_type = extract_pinterest_media(url)
         log.info("Found media: %s (%s)", media_url, media_type)
-        # اسم بسيط للملف
+
         fname = os.path.basename(urlparse(media_url).path)
         if media_type == "video" and not fname.endswith(".mp4"):
             fname += ".mp4"
